@@ -1,12 +1,17 @@
 {
   "schemaVersion": 1,
-  "id": "darkwarro.airdisplay",
+  "id": "darkosxl.airdisplay",
   "name": "AirDisplay",
   "version": "0.2.0",
-  "author": "darkwarro",
+  "author": "Darkosxl",
+  "license": "MIT",
   "description": "Mirror a whole screen to a Miracast TV, or play a video on a DLNA TV. Click to open the AirDisplay menu; highlighted while streaming.",
-  "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
   "barWidget": {
     "displayName": "AirDisplay",
     "description": "Cast your screen or a video to a TV",

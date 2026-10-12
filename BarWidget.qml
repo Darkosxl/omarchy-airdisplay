@@ -9,7 +9,7 @@ import qs.Ui
 // TV. Click opens the menu.
 BarWidget {
   id: root
-  moduleName: "darkwarro.airdisplay"
+  moduleName: "darkosxl.airdisplay"
 
   property var stream: ({ active: false })
   readonly property string script: decodeURIComponent(Qt.resolvedUrl("airdisplay").toString().replace("file://", ""))

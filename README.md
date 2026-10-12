@@ -35,7 +35,7 @@ Pick a screen, then a TV, and the whole screen shows up on it. The screen-share 
 2. **Let the portal take the screen choice.** In `~/.config/hypr/xdph.conf`, set the picker to the plugin's script. Use the full path, because `~` is not expanded there.
    ```
    screencopy {
-       custom_picker_binary = /home/YOU/.config/omarchy/plugins/darkwarro.airdisplay/airdisplay-picker
+       custom_picker_binary = /home/YOU/.config/omarchy/plugins/darkosxl.airdisplay/airdisplay-picker
        allow_token_by_default = true
    }
    ```
@@ -54,7 +54,7 @@ Pick a screen, then a TV, and the whole screen shows up on it. The screen-share 
    ```
 4. **Optional: put the command on your PATH.** This lets you use it from a terminal or from an Omarchy menu entry.
    ```sh
-   ln -s ~/.config/omarchy/plugins/darkwarro.airdisplay/airdisplay ~/.local/bin/airdisplay
+   ln -s ~/.config/omarchy/plugins/darkosxl.airdisplay/airdisplay ~/.local/bin/airdisplay
    ```
 
 The first time you mirror to a TV, the TV may ask you to allow the connection.
@@ -70,6 +70,27 @@ airdisplay tvs                      list Miracast TVs nearby
 ```
 
 `TV` can be a TV's name, part of its name, or its Wi-Fi Direct MAC address as printed by `airdisplay tvs`.
+
+## Update and remove
+
+```sh
+omarchy plugin update darkosxl.airdisplay
+```
+
+To remove it, undo the setup first, in this order:
+
+1. **Restore the default share picker.** Set `custom_picker_binary = hyprland-preview-share-picker` in `~/.config/hypr/xdph.conf`, then run `systemctl --user restart xdg-desktop-portal-hyprland`. Skipping this breaks screen sharing in every app, because the portal would point at a deleted script.
+2. **Remove the plugin and the optional PATH link.**
+   ```sh
+   omarchy plugin remove darkosxl.airdisplay
+   rm -f ~/.local/bin/airdisplay
+   ```
+3. **Close the firewall ports.**
+   ```sh
+   sudo ufw delete allow in proto udp from any port 68 to any port 67 comment airdisplay-miracast-dhcp
+   sudo ufw delete allow in proto tcp from 10.42.0.0/24 to any port 7236 comment airdisplay-miracast
+   ```
+4. **Remove fluxcast if nothing else uses it:** `omarchy pkg remove fluxcast`.
 
 ## Troubleshooting
 
