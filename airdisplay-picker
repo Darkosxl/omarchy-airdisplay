@@ -1,0 +1,11 @@
+#!/bin/sh
+# Screen-share picker for xdg-desktop-portal-hyprland (~/.config/hypr/xdph.conf).
+# airdisplay writes the monitor it wants to $RUN/airdisplay-monitor right before fluxcast asks the
+# portal; answer that once without a dialog. Every other app gets the normal Omarchy picker.
+f="/run/user/$(id -u)/airdisplay-monitor"
+if [ -n "$(find "$f" -mmin -2 2>/dev/null)" ]; then
+  echo "[SELECTION]/screen:$(cat "$f")"
+  rm -f "$f"
+  exit 0
+fi
+exec hyprland-preview-share-picker "$@"

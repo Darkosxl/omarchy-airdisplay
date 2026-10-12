@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""AirDisplay: mirror a whole screen to a Miracast TV, or play a video on a DLNA TV (Samsung TVs do both).
+
+  airdisplay menu                     pick a screen (or a video), then a TV, from the Omarchy menu
+  airdisplay mirror [MONITOR] [TV]    mirror a monitor over Miracast (default: focused monitor, last TV)
+  airdisplay play FILE [TV]           stream a video file over DLNA (transcoded to 1080p H.264)
+  airdisplay stop                     stop whatever is on the TV
+  airdisplay tvs                      list Miracast TVs nearby
+
+Mirroring runs fluxcast (/opt/fluxcast, AUR: fluxcast). The monitor reaches the screen-share portal
+through airdisplay-picker (next to this script), set as custom_picker_binary in ~/.config/hypr/xdph.conf.
+"""
+import http.client, json, os, re, signal, socket, subprocess, sys, time
+import urllib.parse, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from xml.sax.saxutils import escape
+
+PORT = 8099  # play: ufw must allow the TV to reach this port
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATE = os.path.join(RUN, "airdisplay.json")  # watched by the bar widget
+PICK_MON = os.path.join(RUN, "airdisplay-monitor")  # answered once by airdisplay-picker
+LAST_TV = os.path.expanduser("~/.local/state/airdisplay/last-tv.json")  # DLNA (play)
+LAST_SINK = os.path.expanduser("~/.local/state/airdisplay/last-sink.json")  # Miracast (mirror)
+AVT = "urn:schemas-upnp-org:service:AVTransport:1"
+FLAGS = "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+NM = "org.freedesktop.NetworkManager"
+# /usr/bin/python3 has dbus_next; mise's python on PATH doesn't. Portal capture is GStreamer x264 zerolatency
+# (~150-250 ms); fluxcast has no NVENC path. ufw needs 10.42.0.0/24 -> 7236/tcp and DHCP 67/udp open.
+FLUXCAST = ["/usr/bin/python3", "-u", "/opt/fluxcast/main.py", "--protocol", "wfd",
+            "--wfd-capture-backend", "portal", "--fps", "60", "--wfd-no-firewall"]
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "-a", "AirDisplay", "AirDisplay", msg])
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f)
+    os.replace(path + ".tmp", path)
+
+
+def killpg(pid, sig, wait=0):
+    """Signal a process group; wait up to `wait` s for it to exit, then SIGTERM whatever is left."""
+    try:
+        os.killpg(pid, sig)
+        for _ in range(wait * 4):
+            time.sleep(0.25)
+            os.killpg(pid, 0)
+        if wait:
+            os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+# --- Miracast (mirror) -------------------------------------------------------------------------
+
+def bus(*args):
+    r = subprocess.run(["busctl", "--json=short", *args], capture_output=True, text=True)
+    return json.loads(r.stdout)["data"] if r.returncode == 0 and r.stdout.strip() else None
+
+
+def p2p_device():
+    for d in bus("get-property", NM, "/org/freedesktop/NetworkManager", NM, "Devices") or []:
+        if bus("get-property", NM, d, NM + ".Device", "DeviceType") == 30:  # Wi-Fi P2P
+            return d
+
+
+def scan(dev):
+    """Start a Wi-Fi Direct search; NetworkManager fills in peers over the next few seconds."""
+    subprocess.run(["busctl", "call", NM, dev, NM + ".Device.WifiP2P", "StartFind", "a{sv}", "1",
+                    "timeout", "i", "15"], capture_output=True)
+
+
+def sinks(dev):
+    """Miracast displays NetworkManager has seen -> [{name, mac}]."""
+    found = []
+    for p in bus("get-property", NM, dev, NM + ".Device.WifiP2P", "Peers") or []:
+        get = lambda prop: bus("get-property", NM, p, NM + ".WifiP2PPeer", prop)
+        if get("WfdIEs"):  # only Miracast displays advertise Wi-Fi Display info
+            mac = get("HwAddress")
+            found.append({"name": get("Name") or mac, "mac": mac})
+    return sorted(found, key=lambda s: s["name"].lower())
+
+
+def mirror(mon, sink):
+    stop()
+    log = open(os.path.join(RUN, "airdisplay.log"), "w")
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "wfd", sink["mac"], mon, sink["name"]],
+                         start_new_session=True, stdout=log, stderr=log)
+    write_json(STATE, {"active": True, "mode": "miracast", "arg": mon, "title": f"Screen ({mon})",
+                       "tv": sink["name"], "pid": p.pid})
+    write_json(LAST_SINK, sink)
+    notify(f"Connecting to {sink['name']}…")
+
+
+def wfd(mac, mon, name):
+    """One mirroring session (runs detached): fluxcast, then clear the bar state however it ended."""
+    stopped = []
+    # stop() SIGINTs the whole group. fluxcast tears down on it; we only note it and wait.
+    # A caught handler resets to default on exec, so fluxcast still gets KeyboardInterrupt.
+    signal.signal(signal.SIGINT, lambda *a: stopped.append(1))
+    with open(PICK_MON, "w") as f:
+        f.write(mon)
+    p = subprocess.Popen(FLUXCAST + ["--wfd-peer", mac], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    live, last = False, ""
+    for line in p.stdout:
+        print(line, end="", flush=True)  # -> airdisplay.log
+        last = line.strip() or last
+        if not live and "media stream started" in line:
+            live = True
+            notify(f"Screen ({mon}) → {name}")
+    p.wait()
+    try:
+        os.remove(PICK_MON)  # still there = never reached the portal; don't auto-answer another app
+    except FileNotFoundError:
+        pass
+    if read_json(STATE).get("pid") == os.getpid():
+        write_json(STATE, {"active": False})
+    if not stopped:
+        notify(f"Mirroring to {name} ended" if live else f"Couldn't mirror to {name}:\n{last}")
+
+
+# --- DLNA (play) -------------------------------------------------------------------------------
+
+def discover(timeout=2.5):
+    """SSDP search for DLNA renderers -> [{name, control}]."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.3)
+    s.sendto(("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+              f'MAN: "ssdp:discover"\r\nMX: 2\r\nST: {AVT}\r\n\r\n').encode(), ("239.255.255.250", 1900))
+    locs, end = set(), time.time() + timeout
+    while time.time() < end:
+        try:
+            m = re.search(r"(?im)^location:\s*(\S+)", s.recv(65535).decode(errors="ignore"))
+            if m:
+                locs.add(m.group(1))
+        except socket.timeout:
+            pass
+    tvs = {}
+    for loc in locs:
+        try:
+            xml = urllib.request.urlopen(loc, timeout=3).read().decode(errors="ignore")
+        except OSError:
+            continue
+        svc = next((x for x in xml.split("<service>") if "AVTransport" in x), "")
+        ctl, name = re.search(r"<controlURL>\s*([^<\s]+)", svc), re.search(r"<friendlyName>([^<]*)", xml)
+        if ctl and name:
+            tvs[urllib.parse.urljoin(loc, ctl.group(1))] = name.group(1).strip()
+    return sorted(({"name": n, "control": c} for c, n in tvs.items()), key=lambda t: t["name"].lower())
+
+
+def soap(control, action, args=""):
+    body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+            f'<u:{action} xmlns:u="{AVT}"><InstanceID>0</InstanceID>{args}</u:{action}></s:Body></s:Envelope>')
+    u = urllib.parse.urlparse(control)
+    # http.client keeps header case; urllib sends "Soapaction", which Samsung rejects (402 Invalid Args)
+    try:
+        c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=10)
+        c.request("POST", u.path + (f"?{u.query}" if u.query else ""), body.encode(),
+                  {"Content-Type": 'text/xml; charset="utf-8"', "SOAPACTION": f'"{AVT}#{action}"'})
+        return c.getresponse().read().decode(errors="ignore")
+    except OSError as e:
+        return f"<errorDescription>{e}</errorDescription>"
+
+
+def tag(xml, name):
+    m = re.search(rf"<{name}>([^<]*)", xml)
+    return m.group(1) if m else ""
+
+
+def serve(path):
+    # ponytail: always transcode (plays any file, light on Wi-Fi); no seeking from the TV remote.
+    cmd = ["ffmpeg", "-v", "error", "-re", "-hwaccel", "cuda", "-i", path, "-map", "0:v:0", "-map", "0:a:0?",
+           "-vf", "scale=-2:'min(1080,ih)',format=yuv420p", "-c:v", "h264_nvenc", "-preset", "p4",
+           "-b:v", "8M", "-maxrate", "10M", "-bufsize", "16M", "-g", "60",
+           "-c:a", "aac", "-b:a", "192k", "-f", "mpegts", "pipe:1"]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _head(self):
+            self.send_response(200)
+            for k, v in {"Content-Type": "video/mpeg", "transferMode.dlna.org": "Streaming",
+                         "contentFeatures.dlna.org": FLAGS, "Connection": "close"}.items():
+                self.send_header(k, v)
+            self.end_headers()
+
+        def do_HEAD(self):
+            self._head()
+
+        def do_GET(self):
+            # ponytail: one transcode per TV connection; a reconnect restarts the video from the beginning.
+            self._head()
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                while chunk := p.stdout.read1(65536):  # read1: forward what's there, don't wait for 64 KB
+                    self.wfile.write(chunk)
+            except OSError:
+                pass
+            finally:
+                p.terminate()
+                p.wait()
+
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
+def play(path, tv):
+    stop()
+    host = urllib.parse.urlparse(tv["control"]).hostname
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect((host, 9))
+    url = f"http://{s.getsockname()[0]}:{PORT}/stream.ts"
+
+    log = open(os.path.join(RUN, "airdisplay.log"), "w")
+    srv = subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve", path],
+                           start_new_session=True, stdout=log, stderr=log)
+    for _ in range(50):
+        try:
+            socket.create_connection(("127.0.0.1", PORT), 0.2).close()
+            break
+        except OSError:
+            time.sleep(0.1)
+
+    title = os.path.basename(path)
+    didl = ('<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+            f'<item id="1" parentID="-1" restricted="1"><dc:title>{escape(title)}</dc:title>'
+            '<upnp:class>object.item.videoItem</upnp:class>'
+            f'<res protocolInfo="http-get:*:video/mpeg:{FLAGS}">{escape(url)}</res></item></DIDL-Lite>')
+    write_json(STATE, {"active": True, "mode": "play", "arg": path, "title": title,
+                       "tv": tv["name"], "control": tv["control"], "pid": srv.pid})
+    write_json(LAST_TV, tv)
+
+    soap(tv["control"], "Stop")
+    err = tag(soap(tv["control"], "SetAVTransportURI",
+                   f"<CurrentURI>{escape(url)}</CurrentURI><CurrentURIMetaData>{escape(didl)}</CurrentURIMetaData>"),
+              "errorDescription")
+    if not err:
+        err = tag(soap(tv["control"], "Play", "<Speed>1</Speed>"), "errorDescription")
+    for _ in range(20):
+        if err or tag(soap(tv["control"], "GetTransportInfo"), "CurrentTransportState") == "PLAYING":
+            break
+        time.sleep(1)
+    else:
+        err = "TV never started playing"
+    if err:
+        stop()
+        notify(f"{tv['name']}: {err}.\nIf the TV can't reach this laptop, run:\n"
+               f"sudo ufw allow from {host} to any port {PORT} proto tcp")
+        sys.exit(1)
+    notify(f"{title} → {tv['name']}")
+
+
+# --- both ----------------------------------------------------------------------------------------
+
+def stop():
+    st = read_json(STATE)
+    if st.get("active"):
+        if st.get("mode") == "miracast":
+            # fluxcast closes the Wi-Fi Direct link on SIGINT, which takes 10-40 s; SIGTERM would skip that.
+            killpg(st["pid"], signal.SIGINT, wait=60)
+        else:
+            soap(st["control"], "Stop")
+            killpg(st["pid"], signal.SIGTERM)
+    write_json(STATE, {"active": False})
+
+
+def pick(prompt, options, stdin=None):
+    r = subprocess.run(["omarchy-menu-select", prompt, *options], input=stdin, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def pick_sink(dev, since):
+    last = read_json(LAST_SINK)
+    while True:  # the scan started when the menu opened; wait for the last TV, at most ~6 s in total
+        found = sinks(dev)
+        if any(s["mac"] == last.get("mac") for s in found) or time.time() - since > 6:
+            break
+        time.sleep(0.5)
+    if not found:
+        notify("No Miracast TVs found nearby")
+        return None
+    found.sort(key=lambda s: s["mac"] != last.get("mac"))
+    rows = {s["name"]: s for s in found}
+    return rows.get(pick("Mirror to TV", [f"󰔂\t{n}" for n in rows]))
+
+
+def pick_tv():
+    tvs = discover()
+    last = read_json(LAST_TV)
+    if not tvs and last:
+        tvs = [last]  # multicast can miss a sleepy TV; the last one usually still answers
+    if not tvs:
+        notify("No TVs found on this network")
+        return None
+    tvs.sort(key=lambda t: t["control"] != last.get("control"))
+    rows = {f"{t['name']}\t{urllib.parse.urlparse(t['control']).hostname}": t for t in tvs}
+    choice = pick("Send to TV", [f"󰔂\t{r}" for r in rows])
+    return rows.get(choice)
+
+
+def screens():
+    """Monitors as menu rows {"Laptop display\teDP-2": "eDP-2", ...}, focused first."""
+    mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True).stdout)
+    rows = {}
+    for m in sorted(mons, key=lambda m: not m["focused"]):
+        kind = "Laptop display" if m["name"].startswith("eDP") else f"Monitor ({m['model'] or m['name']})"
+        rows[f"{kind}\t{m['name']}"] = m["name"]
+    return rows
+
+
+def default_tv(name=None):
+    if name:
+        return next((t for t in discover() if t["name"].lower() == name.lower()), None)
+    return read_json(LAST_TV) or next(iter(discover()), None)
+
+
+def menu():
+    st = read_json(STATE)
+    dev = p2p_device()
+    since = time.time()
+    if dev:
+        scan(dev)  # look for TVs while the user picks a screen
+    rows = screens()
+    opts = [f"󰅙\tStop\t{st['title']} → {st['tv']}"] if st.get("active") else []
+    opts += [("󰌢" if r.startswith("Laptop") else "󰍹") + f"\t{r}" for r in rows] + ["󰕧\tPlay video"]
+    choice = pick("AirDisplay", opts)
+    if not choice:
+        return
+    if choice.startswith("Stop"):
+        stop()
+    elif choice in rows:
+        if not dev:
+            notify("No Wi-Fi Direct device in NetworkManager")
+            return
+        sink = pick_sink(dev, since)
+        if sink:
+            mirror(rows[choice], sink)
+    else:
+        tv = pick_tv()
+        if not tv:
+            return
+        dirs = ":".join(d for d in (os.path.expanduser("~/Videos"), os.path.expanduser("~/Downloads"))
+                        if os.path.isdir(d))
+        r = subprocess.run(["omarchy-menu-file", "Video to play", dirs, "mp4 mov mkv webm m4v avi"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            play(r.stdout.strip(), tv)
+
+
+def main(argv):
+    cmd, args = (argv[0] if argv else "menu"), argv[1:]
+    if cmd == "menu":
+        menu()
+    elif cmd == "stop":
+        stop()
+    elif cmd == "tvs":
+        dev = p2p_device()
+        scan(dev)
+        time.sleep(6)
+        for s in sinks(dev):
+            print(f"{s['name']}\t{s['mac']}")
+    elif cmd == "serve":
+        serve(*args)
+    elif cmd == "wfd":
+        wfd(*args)
+    elif cmd == "mirror":
+        mons = list(screens().values())
+        mon = args[0] if args else mons[0]
+        if mon not in mons:
+            sys.exit(f"no monitor {mon!r}; have: {', '.join(mons)}")
+        # fluxcast's --wfd-peer takes a MAC or a name substring
+        sink = {"name": args[1], "mac": args[1]} if len(args) > 1 else read_json(LAST_SINK)
+        if not sink:
+            sys.exit("no TV yet: run `airdisplay tvs`, then `airdisplay mirror MONITOR TV`")
+        mirror(mon, sink)
+    elif cmd == "play":
+        if not args:
+            sys.exit("usage: airdisplay play FILE [TV]")
+        tv = default_tv(args[1] if len(args) > 1 else None)
+        if not tv:
+            sys.exit("no TV found")
+        play(os.path.abspath(args[0]), tv)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
