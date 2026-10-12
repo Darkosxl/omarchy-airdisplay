@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
 
 PORT = 8099  # play: ufw must allow the TV to reach this port
-RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+RUN = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"  # private per-user dir, never /tmp
 STATE = os.path.join(RUN, "airdisplay.json")  # watched by the bar widget
 PICK_MON = os.path.join(RUN, "airdisplay-monitor")  # answered once by airdisplay-picker
 LAST_TV = os.path.expanduser("~/.local/state/airdisplay/last-tv.json")  # DLNA (play)
